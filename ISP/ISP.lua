@@ -1,3 +1,4 @@
+-- Central node that allows communications between Routers over the WAN
 local os = require("os")
 local thread = require("thread")
 local event = require("event")
@@ -5,7 +6,6 @@ local component = require("component")
 local serialization = require("serialization")
 
 local modem = component.modem
-
 
 local ispData = {
     ip = "100.0.0.0",
@@ -40,7 +40,15 @@ local function getAddrFromIP(ip)
     return nil
 end
 
-local function generateNewIp(address)
+local function generateNewIp(address, reassign)
+    if reassign then
+        local x = getIPFromAddr(address)
+        if x ~= nil then
+            print("Reassigning IP")
+            return x -- return IP already in ARP table
+        end
+    end
+
     local ip = nil
 
     while ip == nil do
@@ -92,7 +100,7 @@ local function modemReceive(_, da, sa, port, _, sdata)
 
     local data = serialization.unserialize(sdata)
     if data.body.title == "DHCPDISCOVER" then
-        local assignedIP = generateNewIp(sa)
+        local assignedIP = generateNewIp(sa, true)
 
         local payload = serialization.serialize({
             HEADER = {
@@ -100,7 +108,8 @@ local function modemReceive(_, da, sa, port, _, sdata)
                 DADDR = sa,
             }, body = {
                 title = "DHCPOFFER",
-                ip = assignedIP
+                ip = assignedIP,
+                ispIP = ispData.ip
             }
         })
 
@@ -113,7 +122,21 @@ local function modemReceive(_, da, sa, port, _, sdata)
     end
 end
 
-event.listen("modem_message", modemReceive)
+local function modem_message_callback(...)
+    local success, err = pcall(modemReceive, ...)
+    -- print errors
+    if not success then
+        print("Error in callback:", err)
+    end
+end
+event.listen("modem_message", modem_message_callback)
+
+
+local function program_interrupted()
+    event.ignore("modem_message", modem_message_callback)
+    event.ignore("interrupted", program_interrupted)
+end
+event.listen("interrupted", program_interrupted)
 
 while true do
 ---@diagnostic disable-next-line: undefined-field

@@ -1,3 +1,10 @@
+- port forwarding to allow WAN communications between computers
+- figure out why client.lua intercepts messages sent to another address
+- automatically detect LAN clients after router restart
+
+- implement NAT
+- - ports used for communications will be the first part of the network card address (the one before the very first dash)
+
 - installation scripts for ease of infrastructure installation
 
 - change ports for realism?
@@ -11,3 +18,7 @@
 - make WAN.lua a background "daemon" so that every script has the same IP address
 
 - if possible, with the WAN daemon make it so internet API can work over the WAN and ISP if an internet card is not installed in the opencomputer
+
+- LAN/RouterGUI.lua to manage the router from an OC in LAN
+- change terminology ADDR to MAC ? it's still a MAC "address" though...
+- ISP ACK ? maybe not

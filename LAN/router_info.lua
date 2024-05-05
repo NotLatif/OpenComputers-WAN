@@ -6,6 +6,8 @@ if package.loaded.lan then package.loaded.lan = nil end
 
 local net = require("lan")
 
+local ready = false
+
 local function netCallback(data)
     print(serialization.serialize(data))
 end
@@ -16,6 +18,13 @@ local function printMenu()
     print("[I] view computer and router network info")
     print("[N] view router ARP table")
     print("[S] send a message to another computer")
+end
+
+while not ready do
+    if net.getNetworkCardData().ip ~= nil then
+        ready = true
+    end
+    os.sleep(0.5)
 end
 
 local function main()

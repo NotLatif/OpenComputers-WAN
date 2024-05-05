@@ -219,12 +219,21 @@ local function modemReceive(_, localAddr, senderAddr, port, _, sdata)
     end
 end
 
-event.listen("modem_message", function(...)
+local function modem_message_callback(...)
     local success, err = pcall(modemReceive, ...)
     -- print errors
     if not success then
         print("Error in callback:", err)
     end
-end)
+end
+event.listen("modem_message", modem_message_callback)
+
+
+local function program_interrupted()
+    event.ignore("modem_message", modem_message_callback)
+    event.ignore("interrupted", program_interrupted)
+end
+event.listen("interrupted", program_interrupted)
+
 
 return net

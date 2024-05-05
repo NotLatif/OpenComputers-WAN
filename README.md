@@ -12,7 +12,7 @@ idk but I guess I'm having fun
 - WAN communications (routers)
 - ISP to connect multiple routers
 - DHCP assignment to WAN and LAN
-- NAT tables to avoid broadcasting
+- ARP/NAT tables to avoid broadcasting
 
 ## usage
 right now I only tested LAN messages which you can send using `LAN/router_info.lua` script on one OC and have it read by the `LAN/client.lua` script on another OC connected in a LAN with a Router (see below how)
@@ -30,3 +30,6 @@ LAN1 must have the `LAN/lan.lua` lib to be able to use the client scripts, you c
 - as mentioned, WIP
 - nothing is saved to memory right now, so state is preserved as long as the scripts stay loaded
 - please see [TODO.md](TODO.md) for future features
+
+## terminology
+since address and ip address are confusing, in the script whenevery I mention "ADDR" or "ADDRESS" I refer to an opencomputer network card address. If I mention "DA", "SA" or "IP" I refer to an IP Address (Destination, Sender, IP)
