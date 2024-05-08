@@ -1,0 +1,7 @@
+-- will do this later
+-- download files
+-- install wan daemon
+-- install wan lib
+-- ask if install default programs (router editor etc)
+-- ask if install example programs
+-- make daemon run at system startup

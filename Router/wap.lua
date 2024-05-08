@@ -1,0 +1,4 @@
+-- since it's difficult to determine which network card is assigned to LAN in a rack
+-- and since wireless signals have a range
+-- you can put a computer with a WAP whereever you want and it will forward lan messages
+-- to "wifi"

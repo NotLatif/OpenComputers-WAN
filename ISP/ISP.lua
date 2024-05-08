@@ -34,7 +34,7 @@ local function getAddrFromIP(ip)
     local addr = nil
     for a, i in pairs(ARP) do
         if i == ip then
-            return addr
+            return a
         end
     end
     return nil
@@ -52,7 +52,7 @@ local function generateNewIp(address, reassign)
     local ip = nil
 
     while ip == nil do
-        local o1 = tostring(math.floor(math.random(0, 255)))
+        local o1 = tostring(math.floor(math.random(11, 255)))
         local o2 = tostring(math.floor(math.random(0, 255)))
         local o3 = tostring(math.floor(math.random(0, 255)))
         local o4 = tostring(math.floor(math.random(0, 255)))
@@ -83,29 +83,50 @@ local function modemSend(ip, data)
     modem.send(daddr, ispData.respPort, payload)
 end
 
-local function modemForward(ip, serializedData)
-    local daddr = getAddrFromIP(ip)
-    local data = serialization.unserialize(serializedData)
-    print("Forwarded message", data.HEADER.SA, data.HEADER.DA, data.body.title)
-    modem.send(daddr, ispData.respPort, serializedData)
+local function modemBroadcast(data)
+    local payload = serialization.serialize(data)
+    modem.broadcast(ispData.respPort, payload)
 end
 
-local function modemReceive(_, da, sa, port, _, sdata)
-    print("modem_message", da, sa, port, sdata)
-    if port ~= ispData.reqPort then
-        return
-    end
-    print("RECEIVED MESSAGE", da, sa, port)
-    print(sdata)
+local function modemForward(ip, data)
+    local daddr = getAddrFromIP(ip)
 
+    local payload = serialization.serialize(data)
+    print("Forwarding message to " .. daddr, payload)
+    modem.send(daddr, ispData.respPort, payload)
+end
+
+local function modemReceive(_, thisaddr, saddr, port, _, sdata)
     local data = serialization.unserialize(sdata)
+    -- print("modem_message", da, sa, port, sdata)
+    
+    -- TODO huh??
+    -- if port ~= ispData.respPort and port ~= ispData.respPort then
+    --     return
+    -- end
+
+    local senderIP = nil
+    if data.HEADER and data.HEADER.SA then
+        senderIP = data.HEADER.SA
+    end
+    
+    print("RECEIVED MESSAGE FROM ["..senderIP.."]("..saddr..")", port)
+    print(sdata)
+    
+    if data.HEADER and data.HEADER.DA ~= ispData.ip then
+        if data.body and data.body.title ~= "DHCPDISCOVER" then
+            -- destination is not the ISP, trying to forward data
+            modemForward(data.HEADER.DA, data)
+        end
+    end
+
     if data.body.title == "DHCPDISCOVER" then
-        local assignedIP = generateNewIp(sa, true)
+        local assignedIP = generateNewIp(saddr, true)
 
         local payload = serialization.serialize({
             HEADER = {
                 SA = ispData.ip,
-                DADDR = sa,
+                DADDR = saddr,
             }, body = {
                 title = "DHCPOFFER",
                 ip = assignedIP,
@@ -113,14 +134,21 @@ local function modemReceive(_, da, sa, port, _, sdata)
             }
         })
 
-        saveEntryToARP(sa, assignedIP) -- TODO listen for response and saveEntryToARP then (full DHCP protocol)
+        saveEntryToARP(saddr, assignedIP) -- TODO listen for response and saveEntryToARP then (full DHCP protocol)
 
-        modem.send(sa, ispData.respPort, payload)
-    
-    elseif data.body.title == "MESSAGE" then
-        modemForward(data.HEADER.DA, sdata)
+        modem.send(saddr, ispData.respPort, payload)
+
+    elseif data.body.title == "ACK_INIT" then
+        if data.HEADER.SA then
+            print("Detected router [".. data.HEADER.SA .."]", saddr)
+            saveEntryToARP(saddr, data.HEADER.SA)
+        end
+        
+    elseif data.body.title == "GETARP" then -- discorver connected routers
+    elseif data.body.title == "GETDOMAINS" then -- discover "public" domains
     end
 end
+
 
 local function modem_message_callback(...)
     local success, err = pcall(modemReceive, ...)
@@ -137,6 +165,22 @@ local function program_interrupted()
     event.ignore("interrupted", program_interrupted)
 end
 event.listen("interrupted", program_interrupted)
+
+local function syncronizeExistingRouters()
+    print("isp modem address: " .. modem.address)
+    -- find active routers
+    local payload = {
+        HEADER = {SA = ispData.ip},
+        body = {
+            title = "SYN_INIT",
+            ip = ispData.ip
+        }
+    }
+    print("Broadcasting router discovery")
+    modemBroadcast(payload)
+end
+syncronizeExistingRouters()
+
 
 while true do
 ---@diagnostic disable-next-line: undefined-field

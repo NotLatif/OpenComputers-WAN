@@ -14,23 +14,23 @@ local remote_modem_port = 68
 local isp_port = 69
 
 local routerData = {
-    isp = {
-        ip = nil,
-        addr = nil
+    isp = { -- isp data table
+        ip = nil, -- public_ip of the ISP
+        addr = nil -- network address fo the ISP
     },
-    ip = "10.0.0.0",
-    public_ip = nil,
+    ip = "10.0.0.0", -- LAN ip address (gateway)
+    public_ip = nil, -- public ip address
+    subnet_mask = "255.255.255.0"
 }
 
 local modem = {
-    lan = nil,
-    wan = nil
+    lan = nil, -- modem component proxy facing LAN
+    wan = nil -- modem component proxy facing WAN
 }
 
-local ARP = {
-    i = 0
-    -- addr = "ip"
-}
+local ARP = { i = 0 } -- addr = "localip"
+
+local PortMappingTable = {} -- "port" = "local ip"
 
 local NAT = {}
 
@@ -47,47 +47,96 @@ local function extractFourthOctet(ipAddress)
     return octets[4]
 end
 
-local function saveNATEntry(localAddr, destIP)
-    if localAddr == nil or destIP == nil then
+local function isNatAssigned(localPort, localIp)
+    local NATEntry = localIp .. ":" .. localPort
+    if NAT[NATEntry] then
+        return true
+    end
+    return false
+end
+
+local function saveNATEntry(localIP, remoteIP, remotePort) -- returns assigned port
+    if localIP == nil or remoteIP == nil or remotePort == nil then
         return nil
     end
 
-    local NATEntry = destIP .. ":" .. extractFirstAddressPart(localAddr)
+    local localPort = tostring(math.floor(math.random(49152, 65535)))
+    while isNatAssigned(localPort, localIP) do
+        localPort = tostring(math.floor(math.random(49152, 65535)))
+    end
+
+    local NATEntry = localIP .. ":" .. localPort
+
     NAT[NATEntry] = {
-        address = localAddr,
+        localIP = localIP,
+        remoteIP = remoteIP,
+        remotePort = remotePort,
+        localPort = localPort,
         TTL = os.time() + NAT_TTL
     }
-    return NATEntry
+    return localPort
 end
 
 local function refreshNATEntry(entry)
     NAT[entry].TTL = os.time() + NAT_TTL
 end
 
-local function matchNATEntryToAddr(sourceIP, ephemeralPort) -- sourceIP is the one from WAN
-    if sourceIP == nil or ephemeralPort == nil then
+local function getNATLocalIP(remoteIP, localPort) -- sourceIP is the one from WAN
+    if remoteIP == nil or localPort == nil then
         return nil
     end
 
-    local NATEntry = sourceIP .. ":" .. ephemeralPort
-    local destAddr = NAT[NATEntry].address
-    if destAddr then
-        refreshNATEntry(NATEntry)
-        return destAddr
-    else
-        print("NAT entry not found (probably expired).")
-        return nil
-    end
-end
-
-local function cleanup()
     for k, v in pairs(NAT) do
-        if v.TTL > os.time() then
-            NAT[k] = nil
+        if v.localPort == localPort then
+            if v.remoteIP == remoteIP then
+                refreshNATEntry(k)
+                return v.localIP, v.remotePort, k
+            end
         end
     end
+
+    print("NAT entry not found (probably expired).")
+    return nil, nil, nil
 end
 
+local function getNATEntry(remoteIP, localPort)
+    local _, _, e = getNATLocalIP(remoteIP, localPort)
+    if e == nil then    return nil    end
+    return NAT[e]
+end
+
+local function saveEntryToMappingTable(port, ip)
+    if port == nil or ip == nil then
+        print("no port or ip provided", port, ip)
+        return false, "ARG_ERROR"
+    end
+    if PortMappingTable[port] then
+        if PortMappingTable[port] == ip then
+            print("port was already mapped to that ip")
+            return true, "NO_CHANGE"
+        else
+            print("port was mapped to another ip")
+            return false, "ALREADY_USED"
+        end
+    else
+        PortMappingTable[port] = ip
+        return true, "SUCCESS"
+    end
+end
+
+local function getMappingTableEntry(port) -- may return nil
+    return PortMappingTable[port]
+end
+
+local function getMappingTableEntriesForIP(ip)
+    local mappings = {}
+    for p, i in pairs(PortMappingTable) do
+        if i == ip then
+            mappings[p] = i
+        end
+    end
+    return mappings
+end
 
 local function saveEntryToARP(addr, ip)
     ARP[addr] = ip
@@ -95,7 +144,6 @@ end
 
 local function isIpInLan(ip)
     --checks ip against subnet mask to determine if it's in LAN
-    
     -- since subnet is not yet implemented we'll simplify this
     if string.find(ip, "10.0.0") == nil then
         return false
@@ -146,33 +194,74 @@ end
 local function lanForward(addr, ip, unserializedData) -- forward to lan without altering packet
     local payload = serialization.serialize(unserializedData)
     if addr == nil then
-        print("ERROR asked to forward to lan without providing addr. dropping")
-        return
+        local arpAddr = getARP_AddrFromIP(ip)
+        if arpAddr then
+            addr = arpAddr
+        else
+            print("ERROR could not find destination address, dropping.")
+            return
+        end
     end
     if ip == nil then
-        ip = "nil"
+        local arpIP = getARP_IPFromAddr(addr)
+        if arpIP then
+            ip = arpIP
+        else
+            ip = "nil"
+        end
     end
+    -- print("forwarding data:", payload)
     print("forwarding to LAN address " .. addr .. " [" .. ip .. "]" .. " ->")
     modem.lan.send(addr, local_modem_port, payload)
 end
-
-local function wanForward(ip, unserializedData) -- forward to wan without altering packet
-    local payload = serialization.serialize(unserializedData)
-    if ip == nil then
-        ip = "N/A" -- ip may be nil, if it's absent in serializedData the ISP will drop the packet
-    end
-    print("forwarding to WAN ip [" .. ip .. "]" .. " -->")
-    modem.wan.send(routerData.isp.addr, remote_modem_port, payload)
-end
-
 local function lanBroadcast(unserializedData)
     print("Data broadcasted to LAN ->>")
     modem.lan.broadcast(local_modem_port, serialization.serialize(unserializedData))
 end
-local function wanBroadcast(unserializedData)
-    print("Data broadcasted to WAN -->>")
-    modem.wan.broadcast(remote_modem_port, serialization.serialize(unserializedData))
+
+local function wanForward(ip, unserializedData) -- forward to wan without altering packet
+    if ip == routerData.isp.ip then -- message is for ISP, don't process it, just send it
+        local payload = serialization.serialize(unserializedData)
+        modem.wan.send(routerData.isp.addr, remote_modem_port, payload)
+        return
+    end
+    
+    if ip == nil then
+        if unserializedData.HEADER.DA then
+            ip = unserializedData.HEADER.DA
+        else
+            -- probably the router is talking to the ISP directly, otherwise the ISP will drop the packet
+            ip = "nil"
+        end
+    end
+
+    -- save to NAT
+    if unserializedData.HEADER.DA and unserializedData.HEADER.SA and unserializedData.HEADER.DP then
+        local localPort = saveNATEntry(unserializedData.HEADER.SA, unserializedData.HEADER.DA, unserializedData.HEADER.DP)
+        unserializedData.HEADER.SP = localPort
+        print("Opened local port for responses: " .. localPort)
+        -- send ephemeral port open info to sender OC in LAN
+        local lanPayload = {
+            HEADER = {
+                SA = routerData.ip,
+                DA = unserializedData.HEADER.SA
+            },
+            body = {
+                title = "EPORTFWD",
+                port = localPort
+            }
+        }
+        lanForward(nil, unserializedData.HEADER.SA, lanPayload)
+    else
+        print("Data for NAT missing, message responses won't be forwarded")
+    end
+
+    local payload = serialization.serialize(unserializedData)
+    print("forwarding data:", payload)
+    print("forwarding to WAN ip [" .. ip .. "]" .. " -->")
+    modem.wan.send(routerData.isp.addr, remote_modem_port, payload)
 end
+
 
 local function modemForward(data) -- forwards lan/wan messages not meant to the router
     if (not data.HEADER.DA) and (not data.HEADER.DADDR) then
@@ -223,6 +312,9 @@ local function modemForward(data) -- forwards lan/wan messages not meant to the 
             end
         else
             -- destination in is WAN
+            if data.HEADER.port == nil then
+                print("Forwarding message to WAN without port")
+            end
             if routerData.isp.addr then
                 wanForward(data.HEADER.DA, data)
             else
@@ -232,14 +324,14 @@ local function modemForward(data) -- forwards lan/wan messages not meant to the 
     end
 end
 
-local function routerCraftPacketAndSendToIP(ip, data) --sends packets generated by the router
+local function routerCraftPacketAndSendToIP(ip, unserializedBody) --sends packets generated by the router
     print("Crafting packet and sending to ip", ip)
     local payload = {
         HEADER = {
             SA = routerData.ip,
             DA = ip
         },
-        body = data
+        body = unserializedBody
     }
 
     if isIpInLan(ip) then
@@ -250,7 +342,7 @@ local function routerCraftPacketAndSendToIP(ip, data) --sends packets generated 
         else
             lanForward(addr, ip, payload)
         end
-    else -- this should not trigger as router will only talk to WAN through IP when forwarding
+    else
         wanForward(ip, payload)
     end
 end
@@ -288,6 +380,39 @@ local function routerCraftPacketAndSendToAddr(addr, data) --sends packets genera
     end
 end
 
+
+local function handleNCC(unserializedData)
+    -- context: message OC in LAN
+    local body = unserializedData.body
+
+    if body and body.req then
+        if body.req.title == "PMR" then
+            if body.req.external_port then
+                print("Port Mapping Request")
+                local s, msg = saveEntryToMappingTable(body.req.external_port, unserializedData.HEADER.SA)
+
+                if s then
+                    print(msg .. "  new mapping entry: " .. unserializedData.HEADER.SA .. ":" .. body.req.external_port)
+                    body = {
+                        title = "PMA", -- ACK
+                        port = body.req.external_port
+                    }
+                else
+                    print("Error", msg)
+                    body = {
+                        title = "PMF", -- failure
+                        err = msg
+                    }
+                end
+                routerCraftPacketAndSendToIP(unserializedData.HEADER.SA, body)
+                return
+            end
+        end
+    end
+
+    print("got an empty NCC request, dropping.", body)
+end
+
 local function routerHandleLAN(senderAddr, data)
     print(serialization.serialize(data))
     local body = data.body
@@ -317,7 +442,9 @@ local function routerHandleLAN(senderAddr, data)
                 ip = assignedIP,
                 gateway = {
                     ip = routerData.ip,
-                    address = modem.lan.address
+                    address = modem.lan.address,
+                    subnet_mask = routerData.subnet_mask,
+                    public_ip = routerData.public_ip
                 }
             }
             print("DHCPOFFER", "to ".. senderAddr, "IP ".. assignedIP)
@@ -325,8 +452,20 @@ local function routerHandleLAN(senderAddr, data)
             saveEntryToARP(senderAddr, assignedIP)
             -- send data to address (not to ip since computer does not have it yet)
             routerCraftPacketAndSendToAddr(senderAddr, payload)
+        
+        elseif body.title == "ACK_INIT" then
+            print("Detected lan computer ["..data.HEADER.SA.."]")
+            saveEntryToARP(senderAddr, data.HEADER.SA)
+            return
+        end
 
-        elseif body.title == "ROUTERINFO" then
+        -- request subsequent to this line require a sender ip address
+        if data.HEADER.SA == nil then
+            print("Dropping packet without sender address")
+            return
+        end
+
+        if body.title == "ROUTERINFO" then
             print("asked INFO")
             local payload = {
                 title = "ROUTERINFORESP",
@@ -347,11 +486,101 @@ local function routerHandleLAN(senderAddr, data)
                 ARP = ARP
             }
             routerCraftPacketAndSendToIP(data.HEADER.SA, payload)
+
+        elseif body.title == "NATGET" then
+            print("asked NAT")
+            local payload = {
+                title = "NATRESP",
+                NAT = NAT,
+                NAT_TTL = NAT_TTL
+            }
+            routerCraftPacketAndSendToIP(data.HEADER.SA, payload)
+
+        elseif body.title == "PMTGET" then
+            local PMT = nil
+            if body.ip then
+                PMT = getMappingTableEntriesForIP(body.ip)
+            else
+                PMT = PortMappingTable
+            end
+            local payload = {
+                title = "PMTRESP",
+                PMT = PortMappingTable
+            }
+            routerCraftPacketAndSendToIP(data.HEADER.SA, payload)
+
+        elseif body.title == "NCC" then -- Network Configuration Command
+            print("received network configuration command")
+            handleNCC(data)
         end
     end
 end
 
-local function routerHandleWAN(senderAddr, data)
+local function routerHandleWAN(data)
+    if data then
+        if data.HEADER then
+            if data.HEADER.DA == nil then
+                -- isp sent message to every router
+                if data.body then
+                    if data.body.title and data.body.title == "SYN_INIT" then
+                        if data.body.ip and data.body.ip ~= routerData.isp.ip then
+                            routerData.isp.ip = data.body.ip
+                        end
+
+                        local payload = {
+                            HEADER = {
+                                SA = routerData.public_ip,
+                                DA = routerData.isp.ip,
+                                DADDR = routerData.isp.addr
+                            },
+                            body = {
+                                title = "ACK_INIT", -- all needed data is in header
+                            }
+                        }
+                        wanForward(routerData.isp.ip, payload)
+                    end
+                end
+
+                return
+            end
+            if data.HEADER.DA ~= routerData.ip then
+                print("wrong recipient, processing anyways")
+            end
+            if data.HEADER.DP then
+                -- packet is for LAN
+                -- check against port mapping table
+                local lanDestinationForwardedIp = getMappingTableEntry(data.HEADER.DP)
+                local lanDestinationNATIp = getNATEntry(data.HEADER.SA, data.HEADER.DP)
+            
+                if lanDestinationForwardedIp ~= nil and lanDestinationNATIp ~= nil then
+                    -- debug?
+                    print("Found destination on both mapping table and NAT table??\nMAP: " .. lanDestinationForwardedIp, "NAT: " .. lanDestinationNATIp.localIP)
+                    print(data)
+                end
+
+                if lanDestinationForwardedIp then
+                    -- destination found in Mapping table
+                    print("Forwarding WAN message to [" .. lanDestinationForwardedIp .. "]")
+                    lanForward(nil, lanDestinationForwardedIp, data)
+                end
+
+                if lanDestinationNATIp then
+                    -- destination found in NAT table
+                    print("Forwarding WAN message to [" .. lanDestinationNATIp.localIP .. "]")
+                    lanForward(nil, lanDestinationNATIp.localIP, data)
+                end
+            
+            else
+                -- packet is for this router
+            end
+        else
+            print("got packet with no header from wan?? dropping")
+            return
+        end
+    else
+        print("got empty packet from wan??? dropping")
+        return
+    end
     -- figure out to which LAN computer to send
     -- forward to LAN
 end
@@ -367,7 +596,7 @@ local function modemReceive(_, localAddr, senderAddr, port, _, sdata)
         routerHandleLAN(senderAddr, data)
     elseif localAddr == modem.wan.address then
         print("-> RECEIVED WAN", "FROM " .. data.HEADER.SA, "PORT " .. port)
-        routerHandleWAN(senderAddr, data)
+        routerHandleWAN(data)
     else
         print("ERROR", "received message on uninitialized network card")
     end
@@ -382,7 +611,7 @@ local function init()
 
     if #modems ~= 2 then
         print("You need TWO network cards and one needs to be connected to your ISP, the other to your LAN network.")
-        return
+        os.exit()
     end
 
     local function eventFilter(name, ...)
@@ -469,6 +698,21 @@ local function init()
     print("-- INIT DONE --")
 end
 
+local function cleanup()
+    for p, v in pairs(NAT) do
+        if v.TTL > os.time() then
+            local payload = {
+                title = "EPORTCLOSE",
+                port = v.localPort
+            }
+            print("Deleting expired NAT entry: ["..v.localIP..":"..v.localPort.."]")
+            routerCraftPacketAndSendToIP(v.localIP, payload)
+            
+            NAT[p] = nil
+        end
+    end
+end
+
 init()
 
 local function modem_message_callback(...)
@@ -495,6 +739,21 @@ local function program_interrupted()
     end
 end
 event.listen("interrupted", program_interrupted)
+
+
+local function syncronizeExistingLAN()
+    -- find active opencomputers
+    local payload = {
+        HEADER = {SA = routerData.ip},
+        body = {
+            title = "SYN_INIT",
+            gateway = routerData.ip
+        }
+    }
+    print("broadcasting LAN for online computers")
+    lanBroadcast(payload)
+end
+syncronizeExistingLAN()
 
 while true do
 ---@diagnostic disable-next-line: undefined-field

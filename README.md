@@ -1,15 +1,16 @@
 # OC WAN
- **Very basic** WAN simulation for opencomputers
+ **Very basic** WAN simulation for opencomputers,
 
 everything is more of a simulation than an implementation, I'm making this to connect opencomputers of my friends bases and facilities. 
 
 ## why?
-idk but I guess I'm having fun
+it allows you to connect different networks without sharing LAN messages to WAN
 
 ## features 
-- installation scripts (not yet)
+- installation scripts
 - LAN communications
-- WAN communications (routers) (not yet)
+- WAN communications (through routers)
+- Port mapping to receive wan messages
 - ISP to connect multiple routers
 - DHCP assignment to WAN and LAN
 - ARP/NAT tables to avoid broadcasting

@@ -9,15 +9,24 @@ local net = require("lan")
 local ready = false
 
 local function netCallback(data)
-    print(serialization.serialize(data))
+    print("CBK:", serialization.serialize(data))
+end
+
+local function wanResponseCallback(data)
+    print("Message response on port ".. data.HEADER.DP .."\n" .. serialization.serialize(data))
 end
 
 net.load(netCallback, false)
 
 local function printMenu()
     print("[I] view computer and router network info")
-    print("[N] view router ARP table")
     print("[S] send a message to another computer")
+    print("[P] send a port mapping request")
+    -- print("[P-] send a port mapping remove request")
+    print("[N] view router ARP table")
+    print("[T] get router NAT table")
+    print("[F] get router forwarding table")
+    print("[F+] get router forwarding table for this computer")
 end
 
 while not ready do
@@ -32,13 +41,12 @@ local function main()
     local resp = io.read()
     if resp == "I" or resp == "i" then
         local computerNetInfo = net.getNetworkCardData()
-        local routerNetInfo = net.getRouterInfo()
-
         print("- NETWORK CARD -")
         for i,j in pairs(computerNetInfo) do
             print(i, j)
         end
 
+        local routerNetInfo = net.getRouterInfo()
         if routerNetInfo == nil then
             print("Router did not respond.")
             return
@@ -59,15 +67,65 @@ local function main()
         end
 
     elseif resp == "S" or resp == "s" then
-        print("Ender destination IP address or domain [WIP]")
+        print("Ender destination IP address [or domain (WIP)]")
         local destip = io.read()
+
+        local destport = nil
+        if not net.isIpLan(destip) then
+            print("The ip provided is not in LAN, please specify a port")
+            destport = io.read()
+        end
+
         print("Enter message string")
         local msg = io.read()
         local payload = {
             title = "STRING",
             message = msg
         }
-        net.sendMessage(destip, payload)
+        net.sendMessage(destip, payload, destport)
+
+    elseif resp == "T" or resp == "t" then
+        local nat, natttl = net.getNATTable()
+        if nat == nil then
+            print("Response was empty")
+            return
+        end
+
+        print("local_ip","local_port","remote_ip","remote_port", "TTL")
+        local cTime = os.time()
+        for k, v in pairs(nat) do
+            print(v.localIP, v.localPort, v.remoteIP, v.remotePort, cTime - v.TTL)
+        end
+    
+    elseif resp == "P" or resp == "p" then
+        print("Enter port you want to forward to this OC")
+        local extPort = io.read()
+        local p, e = net.requestPortMapping(extPort, wanResponseCallback)
+        if p ~= nil then
+            print("succesfully forwarded port: " .. p)
+        else
+            print("could not forward port: ", e)
+        end
+    
+    elseif resp == "F" or resp == "f" then
+        local fTable = net.getForwardingTable()
+        if fTable ~= nil then
+            for p, i in pairs(fTable) do
+                print(i, p)
+            end
+        else
+            print("Router did not respond.")
+        end
+
+    elseif resp == "F+" or resp == "f+" then
+        local fTable = net.getForwardingTable(net.getNetworkCardData().ip)
+        if fTable ~= nil then
+            for p, i in pairs(fTable) do
+                print(i, p)
+            end
+        else
+            print("Router did not respond.")
+        end
     end
 end
 
