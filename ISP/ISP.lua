@@ -14,10 +14,23 @@ local ispData = {
 }
 
 local ARP = {}
+local DNS = {}
 
 modem.open(ispData.reqPort)
 modem.open(ispData.respPort)
 
+local function remnoveEntryToDSN(domain)
+    return nil
+    -- domain.mc {ip = {entries}}
+end
+local function saveEntryToDSN(domain, ip)
+    return nil
+    -- domain.mc {ip = {entries}}
+end
+local function addSubdomainToDSN(domain, newSubdomain, ip)
+    return nil
+    -- sub1.sub2.domain.mc {ip = {entries}}
+end
 
 local function saveEntryToARP(addr, ip)
     ARP[addr] = ip
@@ -92,6 +105,7 @@ local function modemForward(ip, data)
     local daddr = getAddrFromIP(ip)
 
     local payload = serialization.serialize(data)
+    if daddr == nil then print("Could not convert ip to address, not sending message") end
     print("Forwarding message to " .. daddr, payload)
     modem.send(daddr, ispData.respPort, payload)
 end
@@ -113,7 +127,7 @@ local function modemReceive(_, thisaddr, saddr, port, _, sdata)
     print("RECEIVED MESSAGE FROM ["..senderIP.."]("..saddr..")", port)
     print(sdata)
     
-    if data.HEADER and data.HEADER.DA ~= ispData.ip then
+    if data.HEADER and data.HEADER.DA and data.HEADER.DA ~= ispData.ip then
         if data.body and data.body.title ~= "DHCPDISCOVER" then
             -- destination is not the ISP, trying to forward data
             modemForward(data.HEADER.DA, data)
@@ -143,7 +157,37 @@ local function modemReceive(_, thisaddr, saddr, port, _, sdata)
             print("Detected router [".. data.HEADER.SA .."]", saddr)
             saveEntryToARP(saddr, data.HEADER.SA)
         end
-        
+
+    elseif data.body.title == "DNS_POST" then
+        local name = saveEntryToDSN(data.body.domain, data.body.ip)
+        if name ~= nil then
+            local payload = serialization.serialize({
+                HEADER = {
+                    SA = ispData.ip,
+                    DA = data.HEADER.SA,
+                }, body = {
+                    title = "DNS_ACK",
+                    response = name,
+                }
+            })
+            modem.send(saddr, ispData.respPort, payload)
+        end
+
+    elseif data.body.title == "DNS_PUT" then
+        local name = addSubdomainToDSN(data.body.domain, data.body.subdomain, data.body.ip)
+        if name ~= nil then
+            local payload = serialization.serialize({
+                HEADER = {
+                    SA = ispData.ip,
+                    DA = data.HEADER.SA,
+                }, body = {
+                    title = "DNS_ACK",
+                    response = name,
+                }
+            })
+            modem.send(saddr, ispData.respPort, payload)
+        end
+
     elseif data.body.title == "GETARP" then -- discorver connected routers
     elseif data.body.title == "GETDOMAINS" then -- discover "public" domains
     end

@@ -2,9 +2,9 @@
 local io = require("io")
 local package = require("package")
 local serialization = require("serialization")
-if package.loaded.lan then package.loaded.lan = nil end
+if package.loaded.net then package.loaded.net = nil end
 
-local net = require("lan")
+local net = require("net")
 
 local ready = false
 

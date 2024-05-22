@@ -1,7 +1,11 @@
+- rename "margin" with "padding"
+- add margins for div use?
 - (mostly working) port forwarding to allow WAN communications between computers
 
 - NAT refine, fix bugs (ephemeral ports seem to not be working)
 
+- the router should not need an ISP in order for LAN to function
+- - if ISP is offline when a LAN message is received that network card should be initialized as LAN
 - improve local ip assigning logic to reuse expired IPs (so also implement ip expiration) ?
 - Wireless LAN?
 - auto refresh
@@ -23,4 +27,6 @@
 
 - save tables to files for persistence after restart
 
-- WAP microcontroller
+- WAP microcontroller logic
+- only router should send data to the WAP
+- allow to edit settings like signal strenght, open ports, on/off state, (password?)

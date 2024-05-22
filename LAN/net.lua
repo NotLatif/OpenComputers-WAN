@@ -8,6 +8,7 @@ local net = {}
 local printMessages = true
 
 local ROUTER_RESP_TTL = 3
+local ROUTER_RESP_LONG_TTL = 10
 
 local modem = nil
 for a, _ in pairs(component.list("modem")) do
@@ -111,6 +112,77 @@ function net.getNetworkCardData()
         addr = computerData.networkAddr, -- the address of this OC's network card
         public_ip = computerData.publicIP -- the public ip of the LAN router
     }
+end
+
+function net.askDomainName(domain)
+    local payload = {
+        title = "DNS_POST",
+        name = domain
+    }
+
+    local function eventFilter(name, ...)
+        if name ~= "modem_message" then
+            return false
+        end
+        local sdata = select(5, ...)
+        local data = serialization.unserialize(sdata)
+
+        if data.HEADER and data.HEADER.DA == computerData.ip then
+            if data.body and (data.body.title == "DNS_ACK" or data.body.title == "DNS_DENY") then
+                return true
+            end
+        end
+        return false
+    end
+
+    print("Sending request to router and waiting for response")
+    net.sendMessage(computerData.gatewayIp, payload)
+    local _, _, _, _, _, sdata = event.pullFiltered(ROUTER_RESP_TTL, eventFilter)
+
+    if sdata == nil then return nil, "did not respond" end
+    local data = serialization.unserialize(sdata).body
+
+    if data.response == "DNS_DENY" then
+        return nil, data.reason
+    else
+        return data.response, data.reason
+    end
+end
+
+function net.addSubdomain(domain, subdomain)
+    local payload = {
+        title = "DNS_PUT",
+        domain = domain,
+        subdomain = subdomain
+    }
+
+    local function eventFilter(name, ...)
+        if name ~= "modem_message" then
+            return false
+        end
+        local sdata = select(5, ...)
+        local data = serialization.unserialize(sdata)
+
+        if data.HEADER and data.HEADER.DA == computerData.ip then
+            if data.body and (data.body.title == "DNS_ACK" or data.body.title == "DNS_DENY") then
+                return true
+            end
+        end
+        return false
+    end
+
+    print("Sending request to router and waiting for response")
+    net.sendMessage(computerData.gatewayIp, payload)
+    local _, _, _, _, _, sdata = event.pullFiltered(ROUTER_RESP_TTL, eventFilter)
+
+    if sdata == nil then return nil, "did not respond" end
+    local data = serialization.unserialize(sdata).body
+
+    if data.response == "DNS_DENY" then
+        return nil, data.reason
+    else
+        return data.response, data.reason
+    end
 end
 
 function net.getRouterInfo()
@@ -255,7 +327,10 @@ function net.getARPTable()
     
     if sdata == nil then return nil end
 
-    return serialization.unserialize(sdata).body.ARP
+    local arp = serialization.unserialize(sdata).body.ARP
+    arp.i = nil
+
+    return arp
 end
 
 function net.getNATTable()
@@ -355,7 +430,20 @@ local function modemReceive(_, localAddr, senderAddr, port, _, sdata)
     end
 
     if data.body.title and data.body.title == "DHCPDISCOVER" then
-        return -- another LAN computer wants an IP, packet is useless to us, drop
+        if data.HEADER.SA and data.HEADER.SA == computerData.gatewayIp then
+            local payload = {
+                HEADER = {
+                    SA = computerData.ip,
+                    DA = computerData.gatewayIp
+                },
+                body = {
+                    title = "ACK_LAN", -- all needed data is in header
+                }
+            }
+            modem.send(senderAddr, modemPort, serialization.serialize(payload))
+        else
+            return -- another LAN computer wants an IP, packet is useless to us, drop
+        end
     end
 
     -- if both HEADER.DA and HEADER.DADDR are nil then the message was broadcasted to everyone.
