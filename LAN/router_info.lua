@@ -16,7 +16,7 @@ local function wanResponseCallback(data)
     print("Message response on port ".. data.HEADER.DP .."\n" .. serialization.serialize(data))
 end
 
-net.load(netCallback, false)
+net.load(netCallback, true)
 
 local function printMenu()
     print("[I] view computer and router network info")
@@ -27,6 +27,8 @@ local function printMenu()
     print("[T] get router NAT table")
     print("[F] get router forwarding table")
     print("[F+] get router forwarding table for this computer")
+    print("[D] ask new domain name for this pc's public ip")
+    print("[DS] add subdomain to domain and link it to this pc")
 end
 
 while not ready do
@@ -126,6 +128,28 @@ local function main()
         else
             print("Router did not respond.")
         end
+
+    elseif resp == "D" or resp == "d" then
+        print("Enter the domain name you want to request without any subdomains")
+        local dom = io.read()
+        local r, err = net.askDomainName(dom)
+        print(r, err)
+
+    elseif resp == "DS" or resp == "ds" then
+        print("Specify the domain and subdomain <eg: test.example.mc>")
+        local dom = io.read()
+        print("Specify the port you want to link")
+        local p = io.read()
+        if not net.isForwardedPort(p) then
+            local _, e = net.requestPortMapping(p)
+            if e then
+                print("could not forward port " .. p, e)
+            end
+        end
+
+        local r, err = net.addSubdomain(dom, p)
+
+        print(r, err)
     end
 end
 

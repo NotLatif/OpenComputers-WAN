@@ -19,17 +19,112 @@ local DNS = {}
 modem.open(ispData.reqPort)
 modem.open(ispData.respPort)
 
-local function remnoveEntryToDSN(domain)
-    return nil
-    -- domain.mc {ip = {entries}}
+local function cleanDomainString(string)
+    local parts = {}
+    for part in string:gmatch("[^.]+") do
+        table.insert(parts, part)
+    end
+
+    -- Retain the last two parts as main domain
+    local num_parts = #parts
+    if num_parts >= 2 then
+        -- If there are at least two parts, remove the subdomain
+        return parts[num_parts - 1] .. ".mc"
+    else
+        -- If there are fewer than 2 parts, return the original domain
+        return string
+    end
 end
+
+local function extractSubdomain(domain)
+    -- Split the string into parts using dot as delimiter
+    local parts = {}
+    for part in domain:gmatch("[^.]+") do
+        table.insert(parts, part)
+    end
+
+    -- If there are more than two parts, extract subdomain
+    if #parts > 2 then
+        -- Construct subdomain by joining all parts except the last two
+        local subdomain_parts = {}
+        for i = 1, #parts - 2 do
+            table.insert(subdomain_parts, parts[i])
+        end
+        return table.concat(subdomain_parts, ".")
+    else
+        -- No subdomain present
+        return ""
+    end
+end
+
+-- DNS = {
+--     notlatif = {
+--         ip = "2323231",
+--         sub = {
+--             br = "80"
+--         }
+--     }
+-- }
+local function resolveDNS(domain)
+    local DNSEntry = DNS[cleanDomainString(domain)]
+    if DNSEntry then
+        local sub = DNSEntry.sub[extractSubdomain(domain)]
+        if sub then
+            return DNSEntry.ip, sub
+        else
+            return DNSEntry.ip
+        end
+    end
+
+    return nil
+end
+
+local function removeEntryToDSN(domain)
+    local cleanedDomain = cleanDomainString(domain)
+    if cleanedDomain == "" then return false, "emp" end
+
+    if DNS[cleanedDomain] then
+        DNS[cleanedDomain] = nil
+        return true
+    else
+        return false, "Record "..cleanedDomain.." did not exist"
+    end
+end
+
 local function saveEntryToDSN(domain, ip)
-    return nil
-    -- domain.mc {ip = {entries}}
+    -- detect subdomains
+    local cleanedDomain = cleanDomainString(domain)
+    if cleanedDomain == "" then return nil end
+
+    if DNS[cleanedDomain] then
+        return nil, "Entry already exists."
+    else
+        DNS[cleanedDomain] = {
+            ip = ip,
+            sub = {}
+        }
+        print("successfully added DNS entry for " .. ip .. " ".. domain, cleanedDomain)
+        return cleanedDomain .. ".mc"
+    end
 end
-local function addSubdomainToDSN(domain, newSubdomain, ip)
-    return nil
-    -- sub1.sub2.domain.mc {ip = {entries}}
+local function addSubdomainToDSN(domain, port)
+    local cleanedDomain = cleanDomainString(domain)
+    local newSubdomain = extractSubdomain(domain)
+
+    if cleanedDomain == "" then return nil end
+    if port == nil then return nil, "Arg err no port" end
+
+    if DNS[cleanedDomain] then
+        if DNS[cleanedDomain]["sub"][newSubdomain] then
+            return nil, "subdomain already exists"
+        else
+            DNS[cleanedDomain]["sub"][newSubdomain] = port
+            print("successfully added subdomain "..domain, newSubdomain, port)
+            return newSubdomain .. "." .. cleanedDomain .. ".mc"
+        end
+    else
+        return nil, "domain does not exist"
+    end
 end
 
 local function saveEntryToARP(addr, ip)
@@ -113,7 +208,7 @@ end
 local function modemReceive(_, thisaddr, saddr, port, _, sdata)
     local data = serialization.unserialize(sdata)
     -- print("modem_message", da, sa, port, sdata)
-    
+
     -- TODO huh??
     -- if port ~= ispData.respPort and port ~= ispData.respPort then
     --     return
@@ -123,10 +218,10 @@ local function modemReceive(_, thisaddr, saddr, port, _, sdata)
     if data.HEADER and data.HEADER.SA then
         senderIP = data.HEADER.SA
     end
-    
+
     print("RECEIVED MESSAGE FROM ["..senderIP.."]("..saddr..")", port)
     print(sdata)
-    
+
     if data.HEADER and data.HEADER.DA and data.HEADER.DA ~= ispData.ip then
         if data.body and data.body.title ~= "DHCPDISCOVER" then
             -- destination is not the ISP, trying to forward data
@@ -158,35 +253,117 @@ local function modemReceive(_, thisaddr, saddr, port, _, sdata)
             saveEntryToARP(saddr, data.HEADER.SA)
         end
 
+    elseif data.body.title == "DNS_RESOLVE" then
+        local ip, port = resolveDNS(data.body.domain)
+        if ip ~= nil then
+            local payload = serialization.serialize({
+                HEADER = {
+                    SA = ispData.ip,
+                    DA = data.HEADER.SA,
+                    DP = data.HEADER.SP,
+                    SP = 53,
+                    uuid = data.HEADER.uuid
+                }, body = {
+                    title = "DNS_ACK",
+                    ip = ip,
+                    port = port
+                }
+            })
+            modem.send(saddr, ispData.respPort, payload)
+        else
+            local payload = serialization.serialize({
+                HEADER = {
+                    SA = ispData.ip,
+                    DA = data.HEADER.SA,
+                    DP = data.HEADER.SP,
+                    SP = 53,
+                    uuid = data.HEADER.uuid
+                }, body = {
+                    title = "DNS_DENY",
+                    reason = "Could not resolve Domain name " .. data.body.domain
+                }
+            })
+            modem.send(saddr, ispData.respPort, payload)
+        end
+
     elseif data.body.title == "DNS_POST" then
-        local name = saveEntryToDSN(data.body.domain, data.body.ip)
+        local name, err = saveEntryToDSN(data.body.domain, data.body.ip)
         if name ~= nil then
             local payload = serialization.serialize({
                 HEADER = {
                     SA = ispData.ip,
                     DA = data.HEADER.SA,
+                    DP = data.HEADER.SP,
+                    SP = 53,
+                    uuid = data.HEADER.uuid
                 }, body = {
                     title = "DNS_ACK",
                     response = name,
+                }
+            })
+            modem.send(saddr, ispData.respPort, payload)
+        else
+            local payload = serialization.serialize({
+                HEADER = {
+                    SA = ispData.ip,
+                    DA = data.HEADER.SA,
+                    DP = data.HEADER.SP,
+                    SP = 53,
+                    uuid = data.HEADER.uuid
+                }, body = {
+                    title = "DNS_DENY",
+                    response = nil,
+                    reason = err
                 }
             })
             modem.send(saddr, ispData.respPort, payload)
         end
 
     elseif data.body.title == "DNS_PUT" then
-        local name = addSubdomainToDSN(data.body.domain, data.body.subdomain, data.body.ip)
+        local name, err = addSubdomainToDSN(data.body.domain, data.body.port)
         if name ~= nil then
             local payload = serialization.serialize({
                 HEADER = {
                     SA = ispData.ip,
                     DA = data.HEADER.SA,
+                    DP = data.HEADER.SP,
+                    uuid = data.HEADER.uuid
                 }, body = {
                     title = "DNS_ACK",
                     response = name,
                 }
             })
             modem.send(saddr, ispData.respPort, payload)
+        else
+            local payload = serialization.serialize({
+                HEADER = {
+                    SA = ispData.ip,
+                    DA = data.HEADER.SA,
+                    DP = data.HEADER.SP,
+                    uuid = data.HEADER.uuid
+                }, body = {
+                    title = "DNS_DENY",
+                    response = nil,
+                    reason = err
+                }
+            })
+            modem.send(saddr, ispData.respPort, payload)
         end
+
+    elseif data.body.title == "DNS_DEL" then
+        local succ = removeEntryToDSN(data.body.domain)
+        local payload = serialization.serialize({
+            HEADER = {
+                SA = ispData.ip,
+                DA = data.HEADER.SA,
+                DP = data.HEADER.SP,
+                uuid = data.HEADER.uuid
+            }, body = {
+                title = "DNS_ACK",
+                response = succ and "successfully deleted" or "did not delete",
+            }
+        })
+        modem.send(saddr, ispData.respPort, payload)
 
     elseif data.body.title == "GETARP" then -- discorver connected routers
     elseif data.body.title == "GETDOMAINS" then -- discover "public" domains

@@ -25,13 +25,13 @@ modem.open(modemPort)
 local computerData = {
     networkAddr = modem.address,
     ip = nil,
-    gatewayAddr = nil,
-    gatewayIp = nil,
+    gateway_addr = nil,
+    gateway_ip = nil,
     publicIp = nil,
     subnetMask = nil -- TODO implement
 }
 
-local callback = nil
+local defaultCallback = nil
 local forwardedPorts = {}
 local ephemeralPorts = {}
 
@@ -53,8 +53,128 @@ end
 
 local function dummy(...) end
 
+local function cidrToDot(cidr)
+    local prefix = tonumber(cidr:match("/(%d+)$"))
+    local mask = (2^32 - 1) - (2^(32 - prefix) - 1)
+    local octets = {}
+    for i = 1, 4 do
+        table.insert(octets, 1, math.floor(mask % 256))
+        mask = math.floor(mask / 256)
+    end
+    return table.concat(octets, ".")
+end
+
+local function dotToCIDR(mask, ip)
+    local bits = 0
+    for octet in mask:gmatch("(%d+)") do
+        local num = tonumber(octet)
+        while num > 0 do
+            bits = bits + (num % 2)
+            num = math.floor(num / 2)
+        end
+    end
+    return (ip or "") .. "/" .. bits
+end
+
+local function ipToInt(ip)
+    local octets = {ip:match("(%d+)%.(%d+)%.(%d+)%.(%d+)")}
+    local ip_int = 0
+    for i, octet in ipairs(octets) do
+        ip_int = ip_int + tonumber(octet) * (256 ^ (4 - i))
+    end
+    return ip_int
+end
+
+local function cidrToNetmask(cidr)
+    local ip, prefix = cidr:match("(%d+%.%d+%.%d+%.%d+)/(%d+)")
+    local mask = (2^32 - 1) - (2^(32 - tonumber(prefix)) - 1)
+    return ipToInt(ip), mask
+end
+
+local function isIP(str)
+    local ipv4_pattern = "^%d+%.%d+%.%d+%.%d+$"
+    if string.match(str, ipv4_pattern) then
+        return true
+    end
+    return false
+end
+
+local function isIpInSubnet(ip, subnet)
+    if isIP(subnet) then
+        subnet = dotToCIDR(subnet, computerData.gateway_ip)
+    end
+    local ip_int = ipToInt(ip)
+    local network, mask = cidrToNetmask(subnet)
+    return (ip_int & mask) == (network & mask)
+end
+
+local function generateShortUUID()
+    local random = math.random
+    local template ='xxxxxxxxxxxxxxxxxxxxx'
+    return string.gsub(template, '[xy]', function (c)
+        local v = (c == 'x') and random(0, 0xf) or random(8, 0xb)
+        return string.format('%x', v)
+    end)
+end
+
+function net.sendMessage(ip, body, port)
+    if not computerData.ip or not computerData.gateway_addr then
+        print("lib not initialized correctly, ip was not assigned to this pc. did you load()?")
+    end
+
+    local payload = serialization.serialize({
+        HEADER = {
+            SA = computerData.ip,
+            DA = ip,
+            DP = port -- if the message is routed to LAN this should be nil (if not nil the router will discard it anyway)
+        },
+        body = body
+    })
+
+    print("DEBUG", "modem_send ".. computerData.gateway_addr, modemPort, payload)
+    modem.send(computerData.gateway_addr, modemPort, payload)
+end
+
+local function sendRequestAndAwaitResponse(requestPayload, timeout)
+    local uuid
+    if requestPayload and requestPayload.HEADER and requestPayload.HEADER.uuid then
+        uuid = requestPayload.HEADER.uuid
+    else
+        uuid = generateShortUUID()
+        requestPayload.HEADER.uuid = uuid
+    end
+
+    local function eventFilter(name, ...)
+        if name ~= "modem_message" then
+            return false
+        end
+        local sdata = select(5, ...)
+        local data = serialization.unserialize(sdata)
+
+        if data.HEADER and data.HEADER.uuid == uuid and data.HEADER.DA == computerData.ip then
+            if data.body then
+                return true
+            end
+        end
+        return false
+    end
+    print("Sending request and waiting for response", uuid)
+
+    modem.send(computerData.gateway_addr, modemPort, serialization.serialize(requestPayload))
+    local _, _, _, _, _, sdata = event.pullFiltered(timeout or ROUTER_RESP_TTL, eventFilter)
+    if sdata == nil then    return nil, "did not respond"   end
+
+    local data = serialization.unserialize(sdata)
+    if data.body == nil then
+        print("Err: accepted response with no body", sdata)
+        return nil, "Response had no body"
+    end
+    return data
+end
+
+
 function net.load(c, doPrintDebug) -- load the lib, provide a callback to read incoming messages from both LAN and WAN
-    callback = c
+    defaultCallback = c
     if doPrintDebug ~= nil then
         printMessages = doPrintDebug
     end
@@ -106,260 +226,189 @@ end
 
 function net.getNetworkCardData()
     return {
-        ip = computerData.ip, -- the lan ip of this OC
-        gateway = computerData.gatewayIp, -- the lan ip of the router
-        subnet = computerData.subnetMask, -- the subnet mask
-        addr = computerData.networkAddr, -- the address of this OC's network card
-        public_ip = computerData.publicIP -- the public ip of the LAN router
+        ip = computerData.ip, 
+        gateway = computerData.gateway_ip,
+        subnet = computerData.subnetMask,
+        addr = computerData.networkAddr,
+        public_ip = computerData.public_ip,
+        isp_ip = computerData.isp_ip
     }
+end
+
+function net.resolveDomain(domain)
+    local req = {
+        HEADER = {
+            SA = computerData.ip,
+            DA = computerData.isp_ip,
+            DP = 53
+        },
+        body = {
+            title = "DNS_RESOLVE",
+            domain = domain
+        }
+    }
+
+    local data, err = sendRequestAndAwaitResponse(req, ROUTER_RESP_LONG_TTL)
+    if err ~= nil or data == nil then return nil, (err or "unknown error") end
+
+    if data.body.title == "DNS_DENY" then
+        return nil, nil, data.body.reason
+    else
+        return data.body.ip, data.body.port, nil
+    end
 end
 
 function net.askDomainName(domain)
-    local payload = {
-        title = "DNS_POST",
-        name = domain
+    local req = {
+        HEADER = {
+            SA = computerData.ip,
+            DA = computerData.isp_ip,
+            DP = 53
+        },
+        body = {
+            title = "DNS_POST",
+            domain = domain,
+            ip = computerData.public_ip
+        }
     }
 
-    local function eventFilter(name, ...)
-        if name ~= "modem_message" then
-            return false
-        end
-        local sdata = select(5, ...)
-        local data = serialization.unserialize(sdata)
+    local data, err = sendRequestAndAwaitResponse(req, ROUTER_RESP_LONG_TTL)
+    if err ~= nil or data == nil then return nil, (err or "unknown error") end
 
-        if data.HEADER and data.HEADER.DA == computerData.ip then
-            if data.body and (data.body.title == "DNS_ACK" or data.body.title == "DNS_DENY") then
-                return true
-            end
-        end
-        return false
-    end
-
-    print("Sending request to router and waiting for response")
-    net.sendMessage(computerData.gatewayIp, payload)
-    local _, _, _, _, _, sdata = event.pullFiltered(ROUTER_RESP_TTL, eventFilter)
-
-    if sdata == nil then return nil, "did not respond" end
-    local data = serialization.unserialize(sdata).body
-
-    if data.response == "DNS_DENY" then
-        return nil, data.reason
+    if data.body.title == "DNS_DENY" then
+        return nil, data.body.reason
     else
-        return data.response, data.reason
+        return data.body.response, nil
     end
 end
 
-function net.addSubdomain(domain, subdomain)
-    local payload = {
-        title = "DNS_PUT",
-        domain = domain,
-        subdomain = subdomain
+-- subdomains link to a specific OC in lan through an open port
+function net.addSubdomain(domain, port)
+    local req = {
+        HEADER = {
+            SA = computerData.ip,
+            DA = computerData.isp_ip,
+            DP = 53
+        },
+        body = {
+            title = "DNS_PUT",
+            domain = domain,
+            port = port
+        }
     }
 
-    local function eventFilter(name, ...)
-        if name ~= "modem_message" then
-            return false
-        end
-        local sdata = select(5, ...)
-        local data = serialization.unserialize(sdata)
+    local data, err = sendRequestAndAwaitResponse(req, ROUTER_RESP_LONG_TTL)
+    if err ~= nil or data == nil then return nil, (err or "unknown error") end
 
-        if data.HEADER and data.HEADER.DA == computerData.ip then
-            if data.body and (data.body.title == "DNS_ACK" or data.body.title == "DNS_DENY") then
-                return true
-            end
-        end
-        return false
-    end
-
-    print("Sending request to router and waiting for response")
-    net.sendMessage(computerData.gatewayIp, payload)
-    local _, _, _, _, _, sdata = event.pullFiltered(ROUTER_RESP_TTL, eventFilter)
-
-    if sdata == nil then return nil, "did not respond" end
-    local data = serialization.unserialize(sdata).body
-
-    if data.response == "DNS_DENY" then
+    if data.body.title == "DNS_DENY" then
         return nil, data.reason
     else
-        return data.response, data.reason
+        return data.body.response, nil
     end
 end
 
 function net.getRouterInfo()
-    local payload = {
-        title = "ROUTERINFO"
-    }
-
-    local function eventFilter(name, ...)
-        if name ~= "modem_message" then
-            return false
-        end
-        local sdata = select(5, ...)
-        local data = serialization.unserialize(sdata)
-
-        if data.HEADER and data.HEADER.DA == computerData.ip then
-            if data.body and data.body.title == "ROUTERINFORESP" then
-                return true
-            end
-        end
-        
-        return false
-    end
-
-    print("Sending request to router and waiting for response")
-    net.sendMessage(computerData.gatewayIp, payload)
-    local _, _, _, _, _, sdata = event.pullFiltered(ROUTER_RESP_TTL, eventFilter)
-    
-    if sdata == nil then return nil end
-
-    return serialization.unserialize(sdata).body.info
-end
-
-function net.requestPortMapping(port, callbackFunc)
-    local payload = {
-        title = "NCC",
-        req = {
-            title = "PMR",
-            external_port = port
+    local req = {
+        HEADER = {
+            SA = computerData.ip,
+            DA = computerData.gateway_ip
+        },
+        body = {
+            title = "GET-ROUTERINFO"
         }
     }
 
-    local function eventFilter(name, ...)
-        if name ~= "modem_message" then
-            return false
-        end
-        local sdata = select(5, ...)
-        local data = serialization.unserialize(sdata)
-        print("FILTER - ", sdata)
-        if data.HEADER and data.HEADER.DA == computerData.ip then
-            if data.body and (data.body.title == "PMA" or data.body.title == "PMF") then
-                return true
-            end
-        end
-        return false
-    end
+    local data, err = sendRequestAndAwaitResponse(req)
+    if err ~= nil or data == nil then return nil, (err or "unknown error") end
 
-    print("Sending request to router and waiting for response")
-    net.sendMessage(computerData.gatewayIp, payload)
-    local _, _, _, _, _, sdata = event.pullFiltered(ROUTER_RESP_TTL, eventFilter)
+    return data.body.info
+end
 
-    if sdata == nil then
-        print("router did not respond")
-        return nil
-    end
+function net.requestPortMapping(port, customCallback)
+    local req = {
+        HEADER = {
+            SA = computerData.ip,
+            DA = computerData.gateway_ip
+        },
+        body = {
+            title = "NCC",
+            req = {
+                title = "PMR",
+                external_port = port
+            }
+        }
+    }
 
-    local data = serialization.unserialize(sdata)
-    if data == nil then
-        return nil, "Router did not respond"
-    end
-    if data.body == nil then
-        return nil, "Response error"
-    end
+    local data, err = sendRequestAndAwaitResponse(req)
+    if err ~= nil or data == nil then return nil, (err or "unknown error") end
+
     if data.body.title == "PMA" then
-        if callbackFunc ~= nil then
-            editForwardedPort(data.body.port, callbackFunc)
-        elseif callback ~= nil then
-            editForwardedPort(data.body.port, callback)
+        if customCallback ~= nil then
+            editForwardedPort(data.body.port, customCallback)
+        elseif defaultCallback ~= nil then
+            editForwardedPort(data.body.port, defaultCallback)
         else
             editForwardedPort(data.body.port, dummy)
         end
-        return data.body.port, "SUCCESS"
+        return data.body.port, nil
     else
-        return nil, data.body.err
+        return nil, (data.body.err or "unknown error")
     end
 end
 
 function net.getForwardingTable(ip)
-    local payload = {
-        title = "PMTGET"
+    local req = {
+        HEADER = {
+            SA = computerData.ip,
+            DA = computerData.gateway_ip
+        },
+        body = {
+            title = "PMTGET",
+            ip = (ip or nil)
+        }
     }
-    if ip ~= nil then
-        payload.ip = ip
-    end
 
-    local function eventFilter(name, ...)
-        if name ~= "modem_message" then
-            return false
-        end
-        local sdata = select(5, ...)
-        local data = serialization.unserialize(sdata)
+    local data, err = sendRequestAndAwaitResponse(req)
+    if err ~= nil or data == nil then return nil, (err or "unknown error") end
 
-        if data.HEADER and data.HEADER.DA == computerData.ip then
-            if data.body and data.body.title == "PMTRESP" then
-                return true
-            end
-        end
-        return false
-    end
-
-    print("Sending request to router and waiting for response")
-    net.sendMessage(computerData.gatewayIp, payload)
-    local _, _, _, _, _, sdata = event.pullFiltered(ROUTER_RESP_TTL, eventFilter)
-
-    if sdata == nil then return nil end
-
-    return serialization.unserialize(sdata).body.PMT
+    return data.body.PMT
 end
 
 function net.getARPTable()
-    local payload = {
-        title = "ARPGET"
+    local req = {
+        HEADER = {
+            SA = computerData.ip,
+            DA = computerData.gateway_ip
+        },
+        body = {
+            title = "ARPGET",
+        }
     }
 
-    local function eventFilter(name, ...)
-        if name ~= "modem_message" then
-            return false
-        end
-        local sdata = select(5, ...)
-        local data = serialization.unserialize(sdata)
+    local data, err = sendRequestAndAwaitResponse(req)
+    if err ~= nil or data == nil then return nil, (err or "unknown error") end
 
-        if data.HEADER and data.HEADER.DA == computerData.ip then
-            if data.body and data.body.title == "ARPRESP" then
-                return true
-            end
-        end
-        return false
-    end
-
-    print("Sending request to router and waiting for response")
-    net.sendMessage(computerData.gatewayIp, payload)
-    local _, _, _, _, _, sdata = event.pullFiltered(ROUTER_RESP_TTL, eventFilter)
-    
-    if sdata == nil then return nil end
-
-    local arp = serialization.unserialize(sdata).body.ARP
+    local arp = data.body.ARP
     arp.i = nil
 
     return arp
 end
 
 function net.getNATTable()
-    local payload = {
-        title = "NATGET"
+    local req = {
+        HEADER = {
+            SA = computerData.ip,
+            DA = computerData.gateway_ip
+        },
+        body = {
+            title = "NATGET",
+        }
     }
 
-    local function eventFilter(name, ...)
-        if name ~= "modem_message" then
-            return false
-        end
-        local sdata = select(5, ...)
-        local data = serialization.unserialize(sdata)
+    local data, err = sendRequestAndAwaitResponse(req)
+    if err ~= nil or data == nil then return nil, (err or "unknown error") end
 
-        if data.HEADER and data.HEADER.DA == computerData.ip then
-            if data.body and data.body.title == "NATRESP" then
-                return true
-            end
-        end
-        return false
-    end
-
-    print("Sending request to router and waiting for response")
-    net.sendMessage(computerData.gatewayIp, payload)
-    local _, _, _, _, _, sdata = event.pullFiltered(ROUTER_RESP_TTL, eventFilter)
-    if sdata == nil then return nil end
-
-    local udata = serialization.unserialize(sdata)
-    return udata.NAT, udata.NAT_TTL
+    return data.body.NAT, data.body.NAT_TTL
 end
 
 function net.debug()
@@ -367,40 +416,20 @@ function net.debug()
 end
 
 function net.isIpLan(ip)
-    -- TODO match subnet mask
-    if string.find(ip, "10.0.0") == nil then
-        return false
-    else
-        return true
-    end
+    if not isIP(ip) then    return false    end
+    return isIpInSubnet(ip, computerData.subnet_mask)
 end
 
-function net.sendMessage(ip, body, port)
-    if not computerData.ip or not computerData.gatewayAddr then
-        print("lib not initialized correctly, ip was not assigned to this pc. did you load()?")
-    end
-
-    local payload = serialization.serialize({
-        HEADER = {
-            SA = computerData.ip,
-            DA = ip,
-            DP = port -- if the message is routed to LAN this should be nil (if not nil the router will discard it anyway)
-        },
-        body = body
-    })
-
-    print("DEBUG", "modem_send ".. computerData.gatewayAddr, modemPort, payload)
-    modem.send(computerData.gatewayAddr, modemPort, payload)
-end
-
-local function modemReceive(_, localAddr, senderAddr, port, _, sdata)
+local function modemReceive(_, _, senderAddr, port, _, sdata)
     local data = serialization.unserialize(sdata)
     if data.HEADER then
         if data.HEADER.DADDR and (data.HEADER.DADDR ~= computerData.networkAddr) then
             return -- Dest Addr was not this pc, so definitely discard message  
         end
+        if data.HEADER.uuid then return end -- response was for a function listening elsewere
+
         print("MESSAGE RECEIVE", sdata)
-        if (computerData.publicIP and data.HEADER.DA) and (data.HEADER.DA == computerData.publicIP) then
+        if (computerData.public_ip and data.HEADER.DA) and (data.HEADER.DA == computerData.public_ip) then
             -- Dest Ip is publicIP then message is coming from WAN
             if data.HEADER.DP == nil then
                 -- something wrong with router if this triggers
@@ -413,9 +442,9 @@ local function modemReceive(_, localAddr, senderAddr, port, _, sdata)
                 return
             end
             if data.HEADER.DP and net.isEphemeralPort(data.HEADER.DP) then
-                if callback then
-                    print("Forwarding WAN message to allback (".. data.HEADER.DP ..")")
-                    callback(data)
+                if defaultCallback then
+                    print("Forwarding WAN message to callback (".. data.HEADER.DP ..")")
+                    defaultCallback(data)
                     return
                 end
             else
@@ -430,11 +459,11 @@ local function modemReceive(_, localAddr, senderAddr, port, _, sdata)
     end
 
     if data.body.title and data.body.title == "DHCPDISCOVER" then
-        if data.HEADER.SA and data.HEADER.SA == computerData.gatewayIp then
+        if data.HEADER.SA and data.HEADER.SA == computerData.gateway_ip then
             local payload = {
                 HEADER = {
                     SA = computerData.ip,
-                    DA = computerData.gatewayIp
+                    DA = computerData.gateway_ip
                 },
                 body = {
                     title = "ACK_LAN", -- all needed data is in header
@@ -455,26 +484,28 @@ local function modemReceive(_, localAddr, senderAddr, port, _, sdata)
     if body and body.title then
         if body.title == "DHCPOFFER" then -- save DHCP data
             computerData.ip = body.ip
-            computerData.gatewayIp = body.gateway.ip
-            computerData.gatewayAddr = body.gateway.address
-            computerData.publicIP = body.gateway.public_ip
+            computerData.subnet_mask = body.gateway.subnet_mask
+            computerData.gateway_ip = body.gateway.ip
+            computerData.gateway_addr = body.gateway.address
+            computerData.public_ip = body.gateway.public_ip
+            computerData.isp_ip = body.isp
 
-            print("ACK DHCP", "IP " .. computerData.ip, "FROM " .. computerData.gatewayIp .. " " .. computerData.gatewayAddr)
+            print("ACK DHCP", "IP " .. computerData.ip, "FROM " .. computerData.gateway_ip .. " " .. computerData.gateway_addr)
 
-            if callback then callback("Assigned IP: " .. computerData.ip) end
+            if defaultCallback then defaultCallback("Assigned IP: " .. computerData.ip) end
             return
 
         elseif body.title == "SYN_INIT" then -- router restarted
-            if data.body.gateway and data.body.gateway ~= computerData.gatewayIp then
+            if data.body.gateway and data.body.gateway ~= computerData.gateway_ip then
                 -- computers will only talk to the last router that initializes
-                computerData.gatewayIp = data.body.gateway
-                computerData.gatewayAddr = senderAddr
+                computerData.gateway_ip = data.body.gateway
+                computerData.gateway_addr = senderAddr
             end
 
             local payload = {
                 HEADER = {
                     SA = computerData.ip,
-                    DA = computerData.gatewayIp
+                    DA = computerData.gateway_ip
                 },
                 body = {
                     title = "ACK_INIT", -- all needed data is in header
@@ -484,6 +515,7 @@ local function modemReceive(_, localAddr, senderAddr, port, _, sdata)
 
         elseif body.title == "EPORTFWD" then
             if body.port then
+                print("new eph port: ".. body.port)
                 addEphemeraPort(body.port)
             else
                 print("got EPORTFWD message without port:\n", data)
@@ -499,18 +531,18 @@ local function modemReceive(_, localAddr, senderAddr, port, _, sdata)
             return
 
         elseif body.title == "MESSAGE" then
-            if callback and body.message then
+            if defaultCallback and body.message then
                 print("ACK MSG", "FROM " .. data.HEADER.SA, "TO " .. data.HEADER.DA)
-                callback(body.message)
+                defaultCallback(body.message)
             else
                 print("Received message but there was no callback")
             end
             return
 
         elseif body.title == "STRING" then
-            if callback and body.message then
+            if defaultCallback and body.message then
                 print("ACK STRING", "FROM " .. data.HEADER.SA, "TO " .. data.HEADER.DA)
-                callback(body.message)
+                defaultCallback(body.message)
             else
                 print("Received message but there was no callback")
             end
